@@ -1092,6 +1092,7 @@ LightmapGI::BakeError LightmapGI::bake(Node *p_from_node, String p_image_data_pa
 	Vector<LightsFound> lights_found;
 	Vector<Vector3> probes_found;
 	AABB bounds;
+	bool bounds_empty = true;
 	{
 		Vector<MeshesFound> meshes_found;
 		_find_meshes_and_lights(p_from_node ? p_from_node : get_parent(), meshes_found, lights_found, probes_found);
@@ -1234,8 +1235,9 @@ LightmapGI::BakeError LightmapGI::bake(Node *p_from_node, String p_image_data_pa
 
 					for (int k = 0; k < 3; k++) {
 						Vector3 v = mf.xform.xform(vr[vidx[k]]);
-						if (bounds == AABB()) {
+						if (bounds_empty) {
 							bounds.position = v;
+							bounds_empty = false;
 						} else {
 							bounds.expand_to(v);
 						}
