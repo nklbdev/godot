@@ -616,12 +616,12 @@ int32_t LightmapGI::_compute_bsp_tree(const LocalVector<Vector3> &p_points, cons
 			Vector3 v0 = p_points[simplex0.vertices[i]];
 			for (uint32_t j = 0; j < 3 && !best_plane_score; j++) {
 				if (simplex0.vertices[i] == simplex1.vertices[j]) {
-					break;
+					continue;
 				}
 				Vector3 v1 = p_points[simplex1.vertices[j]];
 				for (uint32_t k = j + 1; k < 4; k++) {
 					if (simplex0.vertices[i] == simplex1.vertices[k]) {
-						break;
+						continue;
 					}
 					Vector3 v2 = p_points[simplex1.vertices[k]];
 
@@ -688,8 +688,9 @@ int32_t LightmapGI::_compute_bsp_tree(const LocalVector<Vector3> &p_points, cons
 					bounds.expand_to(p);
 				}
 			}
+			centers.push_back(bounds.get_center());
 			if (i == 0) {
-				centers.push_back(bounds.get_center());
+				bounds_all = bounds;
 			} else {
 				bounds_all.merge_with(bounds);
 			}
@@ -712,7 +713,7 @@ int32_t LightmapGI::_compute_bsp_tree(const LocalVector<Vector3> &p_points, cons
 		best_plane.d = min_d_dist;
 
 		indices_under.clear();
-		indices_under.push_back(min_d_idx);
+		indices_under.push_back(p_simplex_indices[min_d_idx]);
 
 		indices_over.clear();
 
