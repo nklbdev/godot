@@ -33,6 +33,7 @@
 TEST_FORCE_LINK(test_geometry_3d)
 
 #include "core/math/geometry_3d.h"
+#include "core/math/random_pcg.h"
 
 namespace TestGeometry3D {
 
@@ -200,6 +201,99 @@ TEST_CASE("[Geometry3D] Triangle and Sphere Intersect") {
 	CHECK(Geometry3D::triangle_sphere_intersection_test(triangle_a, triangle_b, triangle_c, Vector3(0, -1, 0), Vector3(0, 0, 0), 5, triangle_contact, sphere_contact) == true);
 	CHECK(Geometry3D::triangle_sphere_intersection_test(triangle_a, triangle_b, triangle_c, Vector3(0, 1, 0), Vector3(0, 0, 0), 5, triangle_contact, sphere_contact) == true);
 	CHECK(Geometry3D::triangle_sphere_intersection_test(triangle_a, triangle_b, triangle_c, Vector3(0, 1, 0), Vector3(20, 0, 0), 5, triangle_contact, sphere_contact) == false);
+}
+
+TEST_CASE("[Geometry3D] Tetrahedralize Delaunay on regular grids") {
+	// Points of a regular grid are cospherical, every cell has its 8 corners on one sphere.
+	// The tetrahedra must fill the grid box exactly once, without overlaps and without holes.
+	const Vector3i sizes[] = { Vector3i(3, 3, 3), Vector3i(4, 3, 4), Vector3i(5, 3, 5), Vector3i(5, 2, 5) };
+	for (const Vector3i &size : sizes) {
+		Vector<Vector3> points;
+		for (int x = 0; x < size.x; x++) {
+			for (int y = 0; y < size.y; y++) {
+				for (int z = 0; z < size.z; z++) {
+					points.push_back(Vector3(x, y, z));
+				}
+			}
+		}
+
+		Vector<int32_t> tetrahedra = Geometry3D::tetrahedralize_delaunay(points);
+		real_t volume = 0;
+		for (int i = 0; i < tetrahedra.size(); i += 4) {
+			const Vector3 a = points[tetrahedra[i + 0]];
+			const Vector3 b = points[tetrahedra[i + 1]];
+			const Vector3 c = points[tetrahedra[i + 2]];
+			const Vector3 d = points[tetrahedra[i + 3]];
+			volume += Math::abs((b - a).dot((c - a).cross(d - a))) / 6;
+		}
+
+		const Vector3i cells = size - Vector3i(1, 1, 1);
+		INFO("Grid ", size.x, "x", size.y, "x", size.z);
+		CHECK(volume == doctest::Approx(cells.x * cells.y * cells.z));
+	}
+}
+
+TEST_CASE("[Geometry3D] Tetrahedralize Delaunay empty circumspheres") {
+	// Random subsets of a small integer lattice, with the 8 corners so the convex hull is the whole cube.
+	// Many points are coplanar and cospherical. Small integers keep the checks below exact in int64.
+	const int size = 6;
+	RandomPCG rng(7);
+	for (int iteration = 0; iteration < 10; iteration++) {
+		Vector<Vector3i> lattice;
+		for (int i = 0; i < 8; i++) {
+			lattice.push_back(Vector3i(i & 1, (i >> 1) & 1, (i >> 2) & 1) * size);
+		}
+		for (int i = 0; i < 300; i++) {
+			lattice.push_back(Vector3i(rng.random(0, size), rng.random(0, size), rng.random(0, size)));
+		}
+		Vector<Vector3> points;
+		for (const Vector3i &p : lattice) {
+			points.push_back(Vector3(p));
+		}
+
+		const auto det3 = [](const int64_t *a, const int64_t *b, const int64_t *c) {
+			return a[0] * (b[1] * c[2] - b[2] * c[1]) - a[1] * (b[0] * c[2] - b[2] * c[0]) + a[2] * (b[0] * c[1] - b[1] * c[0]);
+		};
+
+		Vector<int32_t> tetrahedra = Geometry3D::tetrahedralize_delaunay(points);
+		int64_t volume6 = 0;
+		int flat = 0;
+		int inside = 0;
+		for (int t = 0; t < tetrahedra.size(); t += 4) {
+			int64_t edges[3][3];
+			for (int i = 0; i < 3; i++) {
+				for (int k = 0; k < 3; k++) {
+					edges[i][k] = lattice[tetrahedra[t + i + 1]][k] - lattice[tetrahedra[t]][k];
+				}
+			}
+			const int64_t orientation = det3(edges[0], edges[1], edges[2]);
+			volume6 += Math::abs(orientation);
+			if (orientation == 0) {
+				flat++;
+				continue;
+			}
+
+			// No point may be strictly inside the circumsphere of any tetrahedron.
+			for (const Vector3i &e : lattice) {
+				int64_t rows[4][4];
+				for (int i = 0; i < 4; i++) {
+					for (int k = 0; k < 3; k++) {
+						rows[i][k] = lattice[tetrahedra[t + i]][k] - e[k];
+					}
+					rows[i][3] = rows[i][0] * rows[i][0] + rows[i][1] * rows[i][1] + rows[i][2] * rows[i][2];
+				}
+				const int64_t insphere = rows[0][3] * det3(rows[1], rows[2], rows[3]) - rows[1][3] * det3(rows[0], rows[2], rows[3]) + rows[2][3] * det3(rows[0], rows[1], rows[3]) - rows[3][3] * det3(rows[0], rows[1], rows[2]);
+				if ((orientation > 0 && insphere > 0) || (orientation < 0 && insphere < 0)) {
+					inside++;
+				}
+			}
+		}
+
+		INFO("Iteration ", iteration);
+		CHECK(flat == 0);
+		CHECK(inside == 0);
+		CHECK(volume6 == 6 * size * size * size);
+	}
 }
 
 } // namespace TestGeometry3D

@@ -39,8 +39,6 @@
 #include "core/templates/local_vector.h"
 #include "core/templates/vector.h"
 
-#include <thirdparty/misc/r128.h>
-
 class Delaunay3D {
 	struct Simplex;
 
@@ -55,10 +53,7 @@ class Delaunay3D {
 
 	struct Simplex {
 		uint32_t points[4];
-		R128 circum_center_x;
-		R128 circum_center_y;
-		R128 circum_center_z;
-		R128 circum_r2;
+		int orientation = 0; // Sign of the exact orientation of the four points.
 		LocalVector<GridPos> grid_positions;
 		List<Simplex *>::Element *SE = nullptr;
 
@@ -104,78 +99,234 @@ class Delaunay3D {
 		}
 	};
 
-	_FORCE_INLINE_ static void circum_sphere_compute(const Vector3 *p_points, Simplex *p_simplex) {
-		// The only part in the algorithm where there may be precision errors is this one,
-		// so ensure that we do it with the maximum precision possible.
+	// The predicates below work on the quantized integer coordinates, so they can be evaluated exactly.
+	// Points are quantized to [0, QUANTIZATION_MAX] and the root simplex is about 141 times larger,
+	// so coordinate differences stay below 2^25 and the in-sphere determinant below 2^132.
+	// A double evaluation with an error bound decides almost all cases, the rest is computed exactly
+	// with a small fixed size 256-bit integer.
 
-		R128 v0_x = p_points[p_simplex->points[0]].x;
-		R128 v0_y = p_points[p_simplex->points[0]].y;
-		R128 v0_z = p_points[p_simplex->points[0]].z;
-		R128 v1_x = p_points[p_simplex->points[1]].x;
-		R128 v1_y = p_points[p_simplex->points[1]].y;
-		R128 v1_z = p_points[p_simplex->points[1]].z;
-		R128 v2_x = p_points[p_simplex->points[2]].x;
-		R128 v2_y = p_points[p_simplex->points[2]].y;
-		R128 v2_z = p_points[p_simplex->points[2]].z;
-		R128 v3_x = p_points[p_simplex->points[3]].x;
-		R128 v3_y = p_points[p_simplex->points[3]].y;
-		R128 v3_z = p_points[p_simplex->points[3]].z;
+	static constexpr double UNIT_ROUNDOFF = 1.0 / 9007199254740992.0; // 2^-53.
 
-		// Create the rows of our "unrolled" 3x3 matrix.
-		R128 row1_x = v1_x - v0_x;
-		R128 row1_y = v1_y - v0_y;
-		R128 row1_z = v1_z - v0_z;
+	// Signed 256-bit two's complement integer, only with the operations the predicates need.
+	struct WideInt {
+		uint64_t w[4] = { 0, 0, 0, 0 };
 
-		R128 row2_x = v2_x - v0_x;
-		R128 row2_y = v2_y - v0_y;
-		R128 row2_z = v2_z - v0_z;
+		_FORCE_INLINE_ WideInt() {}
+		_FORCE_INLINE_ explicit WideInt(int64_t p_value) {
+			const uint64_t fill = p_value < 0 ? ~uint64_t(0) : 0;
+			w[0] = uint64_t(p_value);
+			w[1] = fill;
+			w[2] = fill;
+			w[3] = fill;
+		}
 
-		R128 row3_x = v3_x - v0_x;
-		R128 row3_y = v3_y - v0_y;
-		R128 row3_z = v3_z - v0_z;
+		_FORCE_INLINE_ WideInt operator+(const WideInt &p_other) const {
+			WideInt r;
+			uint64_t carry = 0;
+			for (int i = 0; i < 4; i++) {
+				const uint64_t a = w[i] + carry;
+				const uint64_t carry_a = a < carry;
+				r.w[i] = a + p_other.w[i];
+				carry = carry_a + (r.w[i] < a);
+			}
+			return r;
+		}
 
-		R128 sq_length1 = row1_x * row1_x + row1_y * row1_y + row1_z * row1_z;
-		R128 sq_length2 = row2_x * row2_x + row2_y * row2_y + row2_z * row2_z;
-		R128 sq_length3 = row3_x * row3_x + row3_y * row3_y + row3_z * row3_z;
+		_FORCE_INLINE_ WideInt operator-() const {
+			WideInt r;
+			for (int i = 0; i < 4; i++) {
+				r.w[i] = ~w[i];
+			}
+			return r + WideInt(1);
+		}
 
-		// Compute the determinant of said matrix.
-		R128 determinant = row1_x * (row2_y * row3_z - row3_y * row2_z) - row2_x * (row1_y * row3_z - row3_y * row1_z) + row3_x * (row1_y * row2_z - row2_y * row1_z);
+		_FORCE_INLINE_ WideInt operator-(const WideInt &p_other) const {
+			return *this + (-p_other);
+		}
 
-		// Compute the volume of the tetrahedron, and precompute a scalar quantity for reuse in the formula.
-		R128 volume = determinant / R128(6.f);
-		R128 i12volume = R128(1.f) / (volume * R128(12.f));
+		_FORCE_INLINE_ bool is_negative() const {
+			return w[3] >> 63;
+		}
 
-		R128 center_x = v0_x + i12volume * ((row2_y * row3_z - row3_y * row2_z) * sq_length1 - (row1_y * row3_z - row3_y * row1_z) * sq_length2 + (row1_y * row2_z - row2_y * row1_z) * sq_length3);
-		R128 center_y = v0_y + i12volume * (-(row2_x * row3_z - row3_x * row2_z) * sq_length1 + (row1_x * row3_z - row3_x * row1_z) * sq_length2 - (row1_x * row2_z - row2_x * row1_z) * sq_length3);
-		R128 center_z = v0_z + i12volume * ((row2_x * row3_y - row3_x * row2_y) * sq_length1 - (row1_x * row3_y - row3_x * row1_y) * sq_length2 + (row1_x * row2_y - row2_x * row1_y) * sq_length3);
+		_FORCE_INLINE_ int sign() const {
+			if (is_negative()) {
+				return -1;
+			}
+			return (w[0] | w[1] | w[2] | w[3]) ? 1 : 0;
+		}
 
-		// Once we know the center, the radius is clearly the distance to any vertex.
-		R128 rel1_x = center_x - v0_x;
-		R128 rel1_y = center_y - v0_y;
-		R128 rel1_z = center_z - v0_z;
+		// Full 64x64 -> 128 bit unsigned product, portable.
+		_FORCE_INLINE_ static void mul_64(uint64_t p_a, uint64_t p_b, uint64_t &r_lo, uint64_t &r_hi) {
+			const uint64_t a0 = p_a & 0xFFFFFFFF;
+			const uint64_t a1 = p_a >> 32;
+			const uint64_t b0 = p_b & 0xFFFFFFFF;
+			const uint64_t b1 = p_b >> 32;
+			const uint64_t p00 = a0 * b0;
+			const uint64_t p01 = a0 * b1;
+			const uint64_t p10 = a1 * b0;
+			const uint64_t p11 = a1 * b1;
+			const uint64_t mid = (p00 >> 32) + (p01 & 0xFFFFFFFF) + (p10 & 0xFFFFFFFF);
+			r_lo = (p00 & 0xFFFFFFFF) | (mid << 32);
+			r_hi = p11 + (p01 >> 32) + (p10 >> 32) + (mid >> 32);
+		}
 
-		R128 radius1 = rel1_x * rel1_x + rel1_y * rel1_y + rel1_z * rel1_z;
+		// The magnitudes used here stay far below 2^255, so the result never overflows.
+		_FORCE_INLINE_ WideInt operator*(int64_t p_b) const {
+			const bool negative = is_negative() != (p_b < 0);
+			const WideInt a = is_negative() ? -*this : *this;
+			const uint64_t b = p_b < 0 ? uint64_t(0) - uint64_t(p_b) : uint64_t(p_b);
+			WideInt r;
+			uint64_t carry = 0;
+			for (int i = 0; i < 4; i++) {
+				uint64_t lo, hi;
+				mul_64(a.w[i], b, lo, hi);
+				lo += carry;
+				hi += lo < carry;
+				r.w[i] = lo;
+				carry = hi;
+			}
+			return negative ? -r : r;
+		}
+	};
 
-		p_simplex->circum_center_x = center_x;
-		p_simplex->circum_center_y = center_y;
-		p_simplex->circum_center_z = center_z;
-		p_simplex->circum_r2 = radius1;
+	_FORCE_INLINE_ static WideInt det3_exact(const int64_t *p_a, const int64_t *p_b, const int64_t *p_c) {
+		return (WideInt(p_b[1]) * p_c[2] - WideInt(p_b[2]) * p_c[1]) * p_a[0] - (WideInt(p_b[0]) * p_c[2] - WideInt(p_b[2]) * p_c[0]) * p_a[1] + (WideInt(p_b[0]) * p_c[1] - WideInt(p_b[1]) * p_c[0]) * p_a[2];
 	}
 
-	_FORCE_INLINE_ static bool simplex_contains(const Vector3 *p_points, const Simplex &p_simplex, uint32_t p_vertex) {
-		R128 v_x = p_points[p_vertex].x;
-		R128 v_y = p_points[p_vertex].y;
-		R128 v_z = p_points[p_vertex].z;
+	_FORCE_INLINE_ static double det3(const double *p_a, const double *p_b, const double *p_c) {
+		return p_a[0] * (p_b[1] * p_c[2] - p_b[2] * p_c[1]) - p_a[1] * (p_b[0] * p_c[2] - p_b[2] * p_c[0]) + p_a[2] * (p_b[0] * p_c[1] - p_b[1] * p_c[0]);
+	}
 
-		R128 rel2_x = p_simplex.circum_center_x - v_x;
-		R128 rel2_y = p_simplex.circum_center_y - v_y;
-		R128 rel2_z = p_simplex.circum_center_z - v_z;
+	// Same products as det3(), but every term added with its absolute value. Used for the error bound.
+	_FORCE_INLINE_ static double det3_permanent(const double *p_a, const double *p_b, const double *p_c) {
+		return p_a[0] * (p_b[1] * p_c[2] + p_b[2] * p_c[1]) + p_a[1] * (p_b[0] * p_c[2] + p_b[2] * p_c[0]) + p_a[2] * (p_b[0] * p_c[1] + p_b[1] * p_c[0]);
+	}
 
-		R128 radius2 = rel2_x * rel2_x + rel2_y * rel2_y + rel2_z * rel2_z;
+	// Sign of det(b - a, c - a, d - a).
+	static int orientation_sign(const Vector3i *p_points, const Simplex &p_simplex) {
+		const Vector3i &a = p_points[p_simplex.points[0]];
+		int64_t rows[3][3];
+		for (int i = 0; i < 3; i++) {
+			const Vector3i &p = p_points[p_simplex.points[i + 1]];
+			for (int k = 0; k < 3; k++) {
+				rows[i][k] = int64_t(p[k]) - int64_t(a[k]);
+			}
+		}
+		return det3_exact(rows[0], rows[1], rows[2]).sign();
+	}
 
-		return radius2 < (p_simplex.circum_r2 - R128(0.0000000001));
-		// When this tolerance is too big, it can result in overlapping simplices.
-		// When it's too small, large amounts of planar simplices are created.
+	// Sign of the in-sphere determinant of the simplex relative to p_vertex.
+	// For a positively oriented simplex, a positive value means p_vertex is strictly inside its circumsphere.
+	static int insphere_sign(const Vector3i *p_points, const Simplex &p_simplex, uint32_t p_vertex) {
+		const Vector3i &e = p_points[p_vertex];
+		int64_t rows[4][4];
+		double rows_d[4][4];
+		double rows_abs[4][4];
+		for (int i = 0; i < 4; i++) {
+			const Vector3i &p = p_points[p_simplex.points[i]];
+			for (int k = 0; k < 3; k++) {
+				rows[i][k] = int64_t(p[k]) - int64_t(e[k]);
+				rows_d[i][k] = double(rows[i][k]);
+				rows_abs[i][k] = Math::abs(rows_d[i][k]);
+			}
+			// Exact, since the sum of the squares stays below 2^53.
+			rows_d[i][3] = rows_d[i][0] * rows_d[i][0] + rows_d[i][1] * rows_d[i][1] + rows_d[i][2] * rows_d[i][2];
+			rows_abs[i][3] = rows_d[i][3];
+			rows[i][3] = int64_t(rows_d[i][3]);
+		}
+
+		// Fast path in double, with a strict error bound. Let u = 2^-53 be the unit roundoff.
+		// The coordinate differences are integers below 2^25, so the 2x2 minors inside det3() and the
+		// lifted coordinates are integers below 2^53 and are computed exactly. Rounding only happens
+		// after that: one product and two sums in det3(), one product and three sums outside. Each term
+		// goes through at most 7 roundings, so the error is at most 7u / (1 - 7u) times the permanent
+		// (the same expression on absolute values, see det3_permanent()). The computed permanent has
+		// the same relative error, so the error is below 7.01u times the computed permanent, and
+		// 8u = 2^-50 covers it. Multiplying by a power of two is exact. Fused multiply-add only
+		// removes roundings, so the bound also holds if the compiler contracts the expressions.
+		const double value = rows_d[0][3] * det3(rows_d[1], rows_d[2], rows_d[3]) - rows_d[1][3] * det3(rows_d[0], rows_d[2], rows_d[3]) + rows_d[2][3] * det3(rows_d[0], rows_d[1], rows_d[3]) - rows_d[3][3] * det3(rows_d[0], rows_d[1], rows_d[2]);
+		const double permanent = rows_abs[0][3] * det3_permanent(rows_abs[1], rows_abs[2], rows_abs[3]) + rows_abs[1][3] * det3_permanent(rows_abs[0], rows_abs[2], rows_abs[3]) + rows_abs[2][3] * det3_permanent(rows_abs[0], rows_abs[1], rows_abs[3]) + rows_abs[3][3] * det3_permanent(rows_abs[0], rows_abs[1], rows_abs[2]);
+		const double bound = permanent * (8.0 * UNIT_ROUNDOFF);
+		if (value > bound) {
+			return 1;
+		}
+		if (value < -bound) {
+			return -1;
+		}
+
+		// Too close to call, compute exactly.
+		const WideInt exact = det3_exact(rows[1], rows[2], rows[3]) * rows[0][3] - det3_exact(rows[0], rows[2], rows[3]) * rows[1][3] + det3_exact(rows[0], rows[1], rows[3]) * rows[2][3] - det3_exact(rows[0], rows[1], rows[2]) * rows[3][3];
+		return exact.sign();
+	}
+
+	// Bounding sphere of the circumsphere, in quantized coordinates. It is used to register the simplex
+	// in the acceleration grid, so it must contain the whole circumsphere: if a simplex whose circumsphere
+	// contains a new point is not found, the cavity is wrong and the triangulation breaks.
+	// Returns false if the bound can't be established (almost flat simplex), then the whole grid is used.
+	static bool circum_sphere_bound(const Vector3i *p_points, const Simplex &p_simplex, double *r_center, double &r_radius) {
+		const Vector3i &origin = p_points[p_simplex.points[0]];
+		double cols[3][3]; // Edge vectors from the origin vertex, as columns.
+		double cols_abs[3][3];
+		double sq[3]; // Squared edge lengths.
+		for (int i = 0; i < 3; i++) {
+			const Vector3i &p = p_points[p_simplex.points[i + 1]];
+			for (int k = 0; k < 3; k++) {
+				cols[k][i] = double(int64_t(p[k]) - int64_t(origin[k]));
+				cols_abs[k][i] = Math::abs(cols[k][i]);
+			}
+		}
+		for (int i = 0; i < 3; i++) {
+			sq[i] = cols[0][i] * cols[0][i] + cols[1][i] * cols[1][i] + cols[2][i] * cols[2][i];
+		}
+
+		// The center relative to the origin vertex is N / (2 D) by Cramer's rule, where D is the
+		// determinant of the edge vectors and N[k] is the same determinant with column k replaced by sq.
+		// The row passed first to det3() is the only one not used in its 2x2 minors, so sq always goes
+		// first (cyclic permutations keep the sign). Then, like in insphere_sign(), the minors are exact
+		// and each term goes through at most 3 roundings: the error is below 3.01u times the computed
+		// permanent, 4u = 2^-51 covers it.
+		const double d = det3(cols[0], cols[1], cols[2]);
+		const double d_error = det3_permanent(cols_abs[0], cols_abs[1], cols_abs[2]) * (4.0 * UNIT_ROUNDOFF);
+		if (!(Math::abs(d) > 2.0 * d_error)) {
+			return false;
+		}
+		const double n[3] = {
+			det3(sq, cols[1], cols[2]),
+			det3(sq, cols[2], cols[0]),
+			det3(sq, cols[0], cols[1]),
+		};
+		const double n_error[3] = {
+			det3_permanent(sq, cols_abs[1], cols_abs[2]) * (4.0 * UNIT_ROUNDOFF),
+			det3_permanent(sq, cols_abs[2], cols_abs[0]) * (4.0 * UNIT_ROUNDOFF),
+			det3_permanent(sq, cols_abs[0], cols_abs[1]) * (4.0 * UNIT_ROUNDOFF),
+		};
+
+		// For the true values: |N/D - n/d| <= (|N - n| + |n/d| |D - d|) / (|d| - |D - d|).
+		// The division adds one more rounding of the computed center.
+		double center_error = 0.0;
+		double center_length2 = 0.0;
+		for (int k = 0; k < 3; k++) {
+			const double c = n[k] / (2.0 * d);
+			const double error = (n_error[k] + 2.0 * Math::abs(c) * d_error) / (2.0 * (Math::abs(d) - d_error)) + 2.0 * UNIT_ROUNDOFF * Math::abs(c);
+			center_error += error;
+			center_length2 += c * c;
+			r_center[k] = c;
+		}
+
+		// The true sphere is inside the sphere around the computed center with the radius grown by the
+		// center error. The relative margin covers the roundings of these few operations and of the
+		// later additions of the origin and the radius. One quantum covers the rounding of the origin.
+		r_radius = (Math::sqrt(center_length2) + 2.0 * center_error) * (1.0 + 1e-6) + 1.0;
+		for (int k = 0; k < 3; k++) {
+			r_center[k] += double(origin[k]);
+		}
+		return true;
+	}
+
+	// Maps a quantized coordinate to the acceleration grid. Points and circumsphere bounds use this same
+	// function, it is monotonic, so a point inside the bounds always lands in a cell inside the bounds.
+	_FORCE_INLINE_ static int32_t grid_index(double p_coordinate, double p_scale) {
+		return int32_t(CLAMP(p_coordinate * p_scale, 0.0, double(ACCEL_GRID_SIZE - 1)));
 	}
 
 	static bool simplex_is_coplanar(const Vector3 *p_points, const Simplex &p_simplex) {
@@ -194,6 +345,30 @@ class Delaunay3D {
 		return false;
 	}
 
+	static void register_in_grid(List<Simplex *> (&p_grid)[ACCEL_GRID_SIZE][ACCEL_GRID_SIZE][ACCEL_GRID_SIZE], const Vector3i *p_points, const double *p_grid_scale, Simplex *p_simplex) {
+		Vector3i from = Vector3i(0, 0, 0);
+		Vector3i to = Vector3i(ACCEL_GRID_SIZE - 1, ACCEL_GRID_SIZE - 1, ACCEL_GRID_SIZE - 1);
+		double center[3];
+		double radius;
+		if (circum_sphere_bound(p_points, *p_simplex, center, radius)) {
+			for (int k = 0; k < 3; k++) {
+				from[k] = grid_index(center[k] - radius, p_grid_scale[k]);
+				to[k] = grid_index(center[k] + radius, p_grid_scale[k]);
+			}
+		}
+
+		for (int32_t x = from.x; x <= to.x; x++) {
+			for (int32_t y = from.y; y <= to.y; y++) {
+				for (int32_t z = from.z; z <= to.z; z++) {
+					GridPos gp;
+					gp.pos = Vector3i(x, y, z);
+					gp.E = p_grid[x][y][z].push_back(p_simplex);
+					p_simplex->grid_positions.push_back(gp);
+				}
+			}
+		}
+	}
+
 public:
 	struct OutputSimplex {
 		uint32_t points[4];
@@ -201,9 +376,10 @@ public:
 
 	static Vector<OutputSimplex> tetrahedralize(const Vector<Vector3> &p_points) {
 		uint32_t point_count = p_points.size();
-		Vector3 *points = (Vector3 *)memalloc(sizeof(Vector3) * (point_count + 4));
+		LocalVector<Vector3i> quantized;
+		quantized.resize(point_count + 4);
 		const Vector3 *src_points = p_points.ptr();
-		Vector3 proportions;
+		double grid_scale[3]; // From quantized coordinates to acceleration grid cells.
 
 		{
 			AABB rect;
@@ -217,26 +393,28 @@ public:
 			}
 
 			real_t longest_axis = rect.size[rect.get_longest_axis_index()];
-			proportions = Vector3(longest_axis, longest_axis, longest_axis) / rect.size;
-
-			for (uint32_t i = 0; i < point_count; i++) {
-				// Scale points to the unit cube to better utilize R128 precision
-				// and quantize to stabilize triangulation over a wide range of
-				// distances.
-				points[i] = Vector3(Vector3i((src_points[i] - rect.position) / longest_axis * QUANTIZATION_MAX)) / QUANTIZATION_MAX;
+			for (int k = 0; k < 3; k++) {
+				// The grid spans the bounds of the points on each axis. A flat axis gets a single cell.
+				grid_scale[k] = rect.size[k] > 0 ? double(longest_axis) / double(rect.size[k]) * double(ACCEL_GRID_SIZE) / double(QUANTIZATION_MAX) : 0.0;
 			}
 
-			const real_t delta_max = Math::sqrt(2.0) * 100.0;
-			Vector3 center = Vector3(0.5, 0.5, 0.5);
+			for (uint32_t i = 0; i < point_count; i++) {
+				// Scale points to the unit cube and quantize them to integers, so that the
+				// predicates can be evaluated exactly.
+				quantized[i] = Vector3i((src_points[i] - rect.position) / longest_axis * QUANTIZATION_MAX);
+			}
+
+			const int32_t delta_max = int32_t(Math::sqrt(2.0) * 100.0 * double(QUANTIZATION_MAX));
+			const int32_t center = QUANTIZATION_MAX / 2;
 
 			// The larger the root simplex is, the more likely it is that the
 			// triangulation is convex. If it's not absolutely huge, there can
 			// be missing simplices that are not created for the outermost faces
 			// of the point cloud if the point density is very low there.
-			points[point_count + 0] = center + Vector3(0, 1, 0) * delta_max;
-			points[point_count + 1] = center + Vector3(0, -1, 1) * delta_max;
-			points[point_count + 2] = center + Vector3(1, -1, -1) * delta_max;
-			points[point_count + 3] = center + Vector3(-1, -1, -1) * delta_max;
+			quantized[point_count + 0] = Vector3i(center, center + delta_max, center);
+			quantized[point_count + 1] = Vector3i(center, center - delta_max, center + delta_max);
+			quantized[point_count + 2] = Vector3i(center + delta_max, center - delta_max, center - delta_max);
+			quantized[point_count + 3] = Vector3i(center - delta_max, center - delta_max, center - delta_max);
 		}
 
 		List<Simplex *> acceleration_grid[ACCEL_GRID_SIZE][ACCEL_GRID_SIZE][ACCEL_GRID_SIZE];
@@ -245,6 +423,7 @@ public:
 		{
 			//create root simplex
 			Simplex *root = memnew(Simplex(point_count + 0, point_count + 1, point_count + 2, point_count + 3));
+			root->orientation = orientation_sign(quantized.ptr(), *root);
 			root->SE = simplex_list.push_back(root);
 
 			for (uint32_t i = 0; i < ACCEL_GRID_SIZE; i++) {
@@ -257,8 +436,6 @@ public:
 					}
 				}
 			}
-
-			circum_sphere_compute(points, root);
 		}
 
 		AHashMap<Triangle, uint32_t, TriangleHasher> triangles_inserted;
@@ -267,7 +444,7 @@ public:
 		for (uint32_t i = 0; i < point_count; i++) {
 			bool unique = true;
 			for (uint32_t j = i + 1; j < point_count; j++) {
-				if (points[i] == points[j]) {
+				if (quantized[i] == quantized[j]) {
 					unique = false;
 					break;
 				}
@@ -276,15 +453,18 @@ public:
 				continue;
 			}
 
-			Vector3i grid_pos = Vector3i(points[i] * proportions * ACCEL_GRID_SIZE);
-			grid_pos = grid_pos.clampi(0, ACCEL_GRID_SIZE - 1);
+			Vector3i grid_pos;
+			for (int k = 0; k < 3; k++) {
+				grid_pos[k] = grid_index(quantized[i][k], grid_scale[k]);
+			}
 
 			for (List<Simplex *>::Element *E = acceleration_grid[grid_pos.x][grid_pos.y][grid_pos.z].front(); E;) {
 				List<Simplex *>::Element *N = E->next(); //may be deleted
 
 				Simplex *simplex = E->get();
 
-				if (simplex_contains(points, *simplex, i)) {
+				// Points exactly on the circumsphere are not inside.
+				if (insphere_sign(quantized.ptr(), *simplex, i) * simplex->orientation > 0) {
 					static const uint32_t triangle_order[4][3] = {
 						{ 0, 1, 2 },
 						{ 0, 1, 3 },
@@ -322,32 +502,14 @@ public:
 					continue;
 				}
 				Simplex *new_simplex = memnew(Simplex(triangle.triangle[0], triangle.triangle[1], triangle.triangle[2], i));
-				circum_sphere_compute(points, new_simplex);
+				new_simplex->orientation = orientation_sign(quantized.ptr(), *new_simplex);
+				// Never flat: the new point can't lie in the plane of a cavity boundary face. The circumspheres
+				// of the two simplices sharing the face cut that plane in the same circle, so a point in the
+				// plane is either inside both or outside both, and only one of them is in the cavity. This
+				// relies on the exact predicates and on the conservative grid, which finds the whole cavity.
+				DEV_ASSERT(new_simplex->orientation != 0);
 				new_simplex->SE = simplex_list.push_back(new_simplex);
-				{
-					Vector3 center;
-					center.x = double(new_simplex->circum_center_x);
-					center.y = double(new_simplex->circum_center_y);
-					center.z = double(new_simplex->circum_center_z);
-
-					const real_t radius2 = Math::sqrt(double(new_simplex->circum_r2)) + 0.0001;
-					Vector3 extents = Vector3(radius2, radius2, radius2);
-					Vector3i from = Vector3i((center - extents) * proportions * ACCEL_GRID_SIZE);
-					Vector3i to = Vector3i((center + extents) * proportions * ACCEL_GRID_SIZE);
-					from = from.clampi(0, ACCEL_GRID_SIZE - 1);
-					to = to.clampi(0, ACCEL_GRID_SIZE - 1);
-
-					for (int32_t x = from.x; x <= to.x; x++) {
-						for (int32_t y = from.y; y <= to.y; y++) {
-							for (int32_t z = from.z; z <= to.z; z++) {
-								GridPos gp;
-								gp.pos = Vector3(x, y, z);
-								gp.E = acceleration_grid[x][y][z].push_back(new_simplex);
-								new_simplex->grid_positions.push_back(gp);
-							}
-						}
-					}
-				}
+				register_in_grid(acceleration_grid, quantized.ptr(), grid_scale, new_simplex);
 			}
 
 			triangles.clear();
@@ -382,8 +544,6 @@ public:
 		}
 
 		ret_simplices.resize(simplices_written);
-
-		memfree(points);
 
 		return ret_simplices;
 	}
