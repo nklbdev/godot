@@ -896,6 +896,8 @@ Collection of single-file libraries used in Godot components.
   * Version: 1.6.2 (69ba68f1ea666c9136cf56e0105b0cbbe9cd1534, 2026)
   * License: Public Domain or Unlicense
   * Modifications: Added implementation through `r128.c`.
+  * Patches:
+    - `r128-0001-umul128-carry.patch`
 - `smaz.{c,h}`
   * Upstream: https://github.com/antirez/smaz
   * Version: git (2f625846a775501fb69456567409a8b12f10ea25, 2012)

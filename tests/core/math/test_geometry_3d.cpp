@@ -202,4 +202,18 @@ TEST_CASE("[Geometry3D] Triangle and Sphere Intersect") {
 	CHECK(Geometry3D::triangle_sphere_intersection_test(triangle_a, triangle_b, triangle_c, Vector3(0, 1, 0), Vector3(20, 0, 0), 5, triangle_contact, sphere_contact) == false);
 }
 
+TEST_CASE("[Geometry3D] Tetrahedralize Delaunay on a regular grid") {
+	// The 8 corners of every grid cell lie on one sphere, so the circumsphere tests must be precise.
+	Vector<Vector3> points;
+	for (int x = 0; x < 3; x++) {
+		for (int y = 0; y < 3; y++) {
+			for (int z = 0; z < 3; z++) {
+				points.push_back(Vector3(x, y, z));
+			}
+		}
+	}
+	// 8 cells, each split into 6 tetrahedra.
+	CHECK(Geometry3D::tetrahedralize_delaunay(points).size() == 48 * 4);
+}
+
 } // namespace TestGeometry3D

@@ -789,7 +789,7 @@ static void r128__umul128(R128 *dst, R128_U64 a, R128_U64 b)
       carry = ((R128_U64)(R128_U32)p1 + (R128_U64)(R128_U32)p2 + (p0 >> 32)) >> 32;
 
       lo = p0 + ((p1 + p2) << 32);
-      hi = p3 + ((R128_U32)(p1 >> 32) + (R128_U32)(p2 >> 32)) + carry;
+      hi = p3 + ((R128_U64)(R128_U32)(p1 >> 32) + (R128_U64)(R128_U32)(p2 >> 32)) + carry;
 
       R128_SET2(dst, lo, hi);
 #endif
